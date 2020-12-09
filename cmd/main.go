@@ -36,6 +36,12 @@ func createConfig(c *cli.Context) Config {
 		VerboseMode: c.GlobalBool("verbose"),
 		Procs:       c.GlobalInt("procs"),
 	}
+	if config.DebugMode {
+		colog.SetMinLevel(colog.LDebug)
+		if config.VerboseMode {
+			colog.SetMinLevel(colog.LTrace)
+		}
+	}
 
 	if config.Procs < 1 {
 		config.Procs = 1
