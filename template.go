@@ -18,21 +18,20 @@ import (
 )
 
 const DefaultConfigTemplate string = `
-{{ with $path := "/port-balance/{id:[0-9]+}" }}
+{{ with $path := "/port-balance/{id:[0-9]+}" -}}
   {{- with $url := "http://{{ hostport .BASE_IP .BASE_PORT .id }}/api/{{ .id }}" -}}
   {{ HandlePrefix $path (Proxy $url) }}
   {{- end -}}
-{{ end }}
-{{ with $path := "/consistent-hashing/{key}" }}
-  {{- with $url1 := "http://{{ .BASE_IP }}:8081/{{ .key }}/" -}}
-  {{- with $url2 := "http://{{ .BASE_IP }}:8082/{{ .key }}/" -}}
-  {{- with $url3 := "http://{{ .BASE_IP }}:8083/{{ .key }}/" -}}
+{{- end }}
+{{ with $path := "/consistent-hashing/{key}" -}}
+  {{- $url1 := "http://{{ .BASE_IP }}:8081/{{ .key }}/" -}}
+  {{- $url2 := "http://{{ .BASE_IP }}:8082/{{ .key }}/" -}}
+  {{- $url3 := "http://{{ .BASE_IP }}:8083/{{ .key }}/" -}}
   {{ HandleFunc $path (ProxyConsistent $url1 $url2 $url3) }}
-  {{- end -}}
-{{ end }}
-{{ with $path := "/ok" }}
+{{- end }}
+{{ with $path := "/ok" -}}
   {{ HandleFunc $path (Text 200 "OK") }}
-{{ end }}
+{{- end }}
 {{ HandleFunc "/" (Proxy "http://www.google.com/") }}
 `
 
@@ -40,30 +39,27 @@ var (
 	bufPool = bp.NewBufferPool(1000, 128)
 )
 
-func LoadTemplate(path string) (string, error) {
-	return "", nil
-}
-
 type KeyValue map[string]string
 
 type Command struct {
+	Success bool
 	Type    string
 	Handler func(http.ResponseWriter, *http.Request)
 }
 
 var (
 	CommonFuncMap = template.FuncMap{
-		"HostPort": func(baseIP, basePort string, value string) string {
+		"hostport": func(baseIP, basePort string, value string) string {
 			port, _ := strconv.Atoi(basePort)
 			v, _ := strconv.Atoi(value)
 			return net.JoinHostPort(baseIP, strconv.Itoa(port+v))
 		},
-		"Add": func(a, b string) string {
+		"add": func(a, b string) string {
 			i, _ := strconv.Atoi(a)
 			j, _ := strconv.Atoi(b)
 			return strconv.Itoa(i + j)
 		},
-		"Sub": func(a, b string) string {
+		"sub": func(a, b string) string {
 			i, _ := strconv.Atoi(a)
 			j, _ := strconv.Atoi(b)
 			return strconv.Itoa(i - j)
@@ -72,6 +68,12 @@ var (
 )
 
 func createHandlerFuncMap(router *mux.Router, kv KeyValue, allowHeaders []string) template.FuncMap {
+	failureRequest := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`Bad Gateway`))
+	}
+
 	proxyRequest := func(t *template.Template, w http.ResponseWriter, r *http.Request) {
 		reqVar := mux.Vars(r)
 		vars := mergeKeyValue(reqVar, kv)
@@ -101,22 +103,33 @@ func createHandlerFuncMap(router *mux.Router, kv KeyValue, allowHeaders []string
 
 	return template.FuncMap{
 		"HandleFunc": func(path string, cmd Command, methods ...string) string {
+			status := "success"
+			if cmd.Success != true {
+				status = "failure"
+			}
+
 			f := router.HandleFunc(path, cmd.Handler)
 			if 0 < len(methods) {
 				f.Methods(methods...)
 			}
-			return fmt.Sprintf("install route %s = %s", path, cmd.Type)
+			return fmt.Sprintf("install(%s) route %s = %s", status, path, cmd.Type)
 		},
 		"HandlePrefix": func(pattern string, cmd Command, methods ...string) string {
+			status := "success"
+			if cmd.Success != true {
+				status = "failure"
+			}
+
 			f := router.PathPrefix(pattern).HandlerFunc(cmd.Handler)
 			if 0 < len(methods) {
 				f.Methods(methods...)
 			}
-			return fmt.Sprintf("install prefix %s = %s", pattern, cmd.Type)
+			return fmt.Sprintf("install(%s) prefix %s = %s", status, pattern, cmd.Type)
 		},
 		"Text": func(statusCode int, txt string) Command {
 			return Command{
-				Type: "text",
+				Success: true,
+				Type:    "text",
 				Handler: func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "text/plain")
 					w.WriteHeader(statusCode)
@@ -125,25 +138,45 @@ func createHandlerFuncMap(router *mux.Router, kv KeyValue, allowHeaders []string
 			}
 		},
 		"Proxy": func(urlTemplate string) Command {
-			t := template.Must(template.New("proxy").Funcs(CommonFuncMap).Parse(urlTemplate))
+			t, err := template.New("proxy").Funcs(CommonFuncMap).Parse(urlTemplate)
+			if err != nil {
+				log.Printf("error: template parse error: %s", err.Error())
+				return Command{
+					Success: false,
+					Type:    "proxy",
+					Handler: failureRequest,
+				}
+			}
+
 			return Command{
-				Type: "proxy",
+				Success: true,
+				Type:    "proxy",
 				Handler: func(w http.ResponseWriter, r *http.Request) {
 					proxyRequest(t, w, r)
 				},
 			}
 		},
 		"ProxyConsistent": func(urlTemplates ...string) Command {
-			c := consistent.New()
 			templates := make(map[string]*template.Template, len(urlTemplates))
+			c := consistent.New()
 			for i, t := range urlTemplates {
 				name := fmt.Sprintf("proxy-consistent:%d", i)
-				p := template.Must(template.New(name).Funcs(CommonFuncMap).Parse(t))
+				p, err := template.New(name).Funcs(CommonFuncMap).Parse(t)
+				if err != nil {
+					log.Printf("error: template parse error: %s", err.Error())
+					return Command{
+						Success: false,
+						Type:    "proxy-consistent",
+						Handler: failureRequest,
+					}
+				}
+
 				templates[t] = p
 				c.Add(t)
 			}
 			return Command{
-				Type: "proxy-consistent",
+				Success: true,
+				Type:    "proxy-consistent",
 				Handler: func(w http.ResponseWriter, r *http.Request) {
 					tpl, err := c.Get(r.URL.String())
 					if err != nil {
@@ -153,6 +186,7 @@ func createHandlerFuncMap(router *mux.Router, kv KeyValue, allowHeaders []string
 						w.Write([]byte(`Internal Server Error`))
 						return
 					}
+
 					t := templates[tpl]
 					proxyRequest(t, w, r)
 				},
@@ -179,6 +213,7 @@ func newReverseProxy(originReq *http.Request, u *url.URL, allowHeaders []string)
 		req.URL.Scheme = u.Scheme
 		req.URL.Host = u.Host
 		req.URL.Path = u.Path
+
 		if targetQuery == "" || req.URL.RawQuery == "" {
 			req.URL.RawQuery = targetQuery + req.URL.RawQuery
 		} else {
@@ -202,13 +237,45 @@ func applyTemplate(tpl string, kv KeyValue, router *mux.Router, allowHeaders []s
 	for name, fn := range CommonFuncMap {
 		handlerFuncMap[name] = fn
 	}
+	for name, _ := range handlerFuncMap {
+		log.Printf("debug: use func %s", name)
+	}
 
 	t := strings.TrimSpace(tpl)
 	tp := template.Must(template.New("base").Funcs(handlerFuncMap).Parse(t))
 	if err := tp.Execute(buf, kv); err != nil {
 		return err
 	}
-	log.Println(html.UnescapeString(buf.String()))
+
+	err := router.Walk(func(r *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
+		pathTemplate, err := r.GetPathTemplate()
+		if err == nil {
+			log.Printf("debug: ROUTE:%s", pathTemplate)
+		}
+		pathRegexp, err := r.GetPathRegexp()
+		if err == nil {
+			log.Printf("debug: Path regexp:%s", pathRegexp)
+		}
+		queriesTemplates, err := r.GetQueriesTemplates()
+		if err == nil {
+			log.Printf("debug: Queries templates:%s", strings.Join(queriesTemplates, ","))
+		}
+		queriesRegexps, err := r.GetQueriesRegexp()
+		if err == nil {
+			log.Printf("debug: Queries regexps:%s", strings.Join(queriesRegexps, ","))
+		}
+		methods, err := r.GetMethods()
+		if err == nil {
+			log.Printf("debug: Methods:%s", strings.Join(methods, ","))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("trace: load config template: %s", t)
+	log.Printf("info: \n%s\n", html.UnescapeString(buf.String()))
 	return nil
 }
 
