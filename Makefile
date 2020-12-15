@@ -16,7 +16,7 @@ ghpkg:
 	docker push docker.pkg.github.com/octu0/revproxy/$(_NAME):$(_VERSION)
 
 .PHONY: pkg
-pkg:
+pkg: build
 	mkdir -p "$(PWD)/pkg"
 	$(eval binpath_linux := "$(PWD)/pkg/$(_NAME)_linux_amd64-$(_VERSION)")
 	$(eval binpath_darwin := "$(PWD)/pkg/$(_NAME)_darwin_amd64-$(_VERSION)")
